@@ -249,6 +249,10 @@ The summaries should always be generated in English, regardless of the source la
 
 The initial plan is to use Gemini free tier, with the model controlled through environment variables.
 
+Before changing `GEMINI_MODEL`, verify the exact model ID supported by your API key and the current quotas in Google AI Studio:
+
+- https://aistudio.google.com/rate-limit
+
 Recommended default:
 
 - `GEMINI_MODEL=gemini-2.5-flash-lite`
@@ -279,6 +283,10 @@ The implementation should keep prompts deterministic, concise, and versioned whe
 ## Rate Limit Strategy
 
 Free-tier usage is viable if the service is conservative about comment re-summarization.
+
+Published quota tables are only a general reference. The effective limits and available model IDs for a specific API key should be checked in Google AI Studio:
+
+- https://aistudio.google.com/rate-limit
 
 The default strategy should be:
 
