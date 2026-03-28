@@ -10,6 +10,14 @@ from .models import GeminiResponse, GeminiUsage
 LOGGER = logging.getLogger(__name__)
 
 
+class GeminiError(RuntimeError):
+    """Base Gemini client error."""
+
+
+class GeminiDailyQuotaExceededError(GeminiError):
+    """Raised when the model daily request quota is exhausted."""
+
+
 class GeminiClient:
     def __init__(self, api_key: str, model: str, timeout_seconds: int) -> None:
         self.api_key = api_key
@@ -97,10 +105,10 @@ class GeminiClient:
         except HTTPError as error:
             detail = error.read().decode("utf-8", errors="replace")
             LOGGER.warning("Gemini request failed with HTTP %s: %s", error.code, detail)
-            raise RuntimeError(f"Gemini request failed with HTTP {error.code}") from error
+            raise _classify_http_error(error.code, detail) from error
         except URLError as error:
             LOGGER.warning("Gemini request failed with URL error: %s", error.reason)
-            raise RuntimeError(f"Gemini request failed: {error.reason}") from error
+            raise GeminiError(f"Gemini request failed: {error.reason}") from error
 
         return GeminiResponse(
             text=_extract_response_text(body),
@@ -137,3 +145,34 @@ def _extract_usage(usage_metadata: dict) -> GeminiUsage:
         thoughts_token_count=int(usage_metadata.get("thoughtsTokenCount", 0) or 0),
         total_token_count=int(usage_metadata.get("totalTokenCount", 0) or 0),
     )
+
+
+def _classify_http_error(status_code: int, detail: str) -> GeminiError:
+    parsed_detail = _safe_json_loads(detail)
+    if status_code == 429 and _is_daily_quota_exceeded(parsed_detail):
+        return GeminiDailyQuotaExceededError(
+            f"Gemini daily quota exhausted for the configured model: HTTP {status_code}"
+        )
+    return GeminiError(f"Gemini request failed with HTTP {status_code}")
+
+
+def _is_daily_quota_exceeded(parsed_detail: dict | None) -> bool:
+    if not parsed_detail:
+        return False
+    error = parsed_detail.get("error") or {}
+    details = error.get("details") or []
+    for item in details:
+        violations = item.get("violations") or []
+        for violation in violations:
+            quota_id = violation.get("quotaId", "")
+            if "PerDay" in quota_id:
+                return True
+    return False
+
+
+def _safe_json_loads(detail: str) -> dict | None:
+    try:
+        loaded = json.loads(detail)
+    except json.JSONDecodeError:
+        return None
+    return loaded if isinstance(loaded, dict) else None

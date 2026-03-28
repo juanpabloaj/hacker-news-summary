@@ -14,7 +14,7 @@ from .formatting import (
 from .hn_client import fetch_comments_text, fetch_front_page_posts
 from .models import FrontPagePost, PostRecord
 from .storage import Storage
-from .summarizer import GeminiClient
+from .summarizer import GeminiClient, GeminiDailyQuotaExceededError
 from .telegram import TelegramClient
 
 LOGGER = logging.getLogger(__name__)
@@ -44,9 +44,11 @@ class PollingService:
         self.storage = storage
         self.gemini_client = gemini_client
         self.telegram_client = telegram_client
+        self.gemini_daily_quota_exhausted = False
 
     def run_cycle(self) -> None:
         self.storage.initialize()
+        self.gemini_daily_quota_exhausted = False
         stats = CycleStats()
         usage_before = self.storage.get_gemini_usage_totals()
         gemini_calls_before = self.storage.get_gemini_call_count()
@@ -183,6 +185,12 @@ class PollingService:
             return self._generate_article_summary_from_url_fallback(
                 post, local_fetch_error=fetch_result.error_message
             )
+        if self.gemini_daily_quota_exhausted:
+            summary = ARTICLE_FALLBACK_SUMMARY
+            self.storage.store_article_summary(
+                post.hn_id, fetch_result.content_hash, self.config.gemini_model, summary
+            )
+            return summary
         try:
             response = self.gemini_client.summarize_article(
                 post.title,
@@ -198,6 +206,9 @@ class PollingService:
                 usage=response.usage,
             )
             summary = response.text
+        except GeminiDailyQuotaExceededError:
+            self._mark_gemini_daily_quota_exhausted(post.hn_id)
+            summary = ARTICLE_FALLBACK_SUMMARY
         except Exception:
             LOGGER.exception("Article summary generation failed for hn_id=%s", post.hn_id)
             summary = ARTICLE_FALLBACK_SUMMARY
@@ -222,6 +233,10 @@ class PollingService:
             content_hash=None,
             error_message=local_fetch_error,
         )
+        if self.gemini_daily_quota_exhausted:
+            summary = ARTICLE_FALLBACK_SUMMARY
+            self.storage.store_article_summary(post.hn_id, None, self.config.gemini_model, summary)
+            return summary
         try:
             response = self.gemini_client.summarize_article_from_url(
                 post.title,
@@ -236,6 +251,9 @@ class PollingService:
                 usage=response.usage,
             )
             summary = response.text
+        except GeminiDailyQuotaExceededError:
+            self._mark_gemini_daily_quota_exhausted(post.hn_id)
+            summary = ARTICLE_FALLBACK_SUMMARY
         except Exception:
             LOGGER.exception("Gemini URL-context article summary failed for hn_id=%s", post.hn_id)
             summary = ARTICLE_FALLBACK_SUMMARY
@@ -254,6 +272,8 @@ class PollingService:
             return str(latest["summary_text"]), tree_hash
         if not comments_text:
             return COMMENTS_FALLBACK_SUMMARY, tree_hash
+        if self.gemini_daily_quota_exhausted:
+            return COMMENTS_FALLBACK_SUMMARY, tree_hash
         try:
             response = self.gemini_client.summarize_comments(
                 post.title,
@@ -268,10 +288,22 @@ class PollingService:
                 usage=response.usage,
             )
             summary = response.text
+        except GeminiDailyQuotaExceededError:
+            self._mark_gemini_daily_quota_exhausted(post.hn_id)
+            summary = COMMENTS_FALLBACK_SUMMARY
         except Exception:
             LOGGER.exception("Comments summary generation failed for hn_id=%s", post.hn_id)
             summary = COMMENTS_FALLBACK_SUMMARY
         return summary, tree_hash
+
+    def _mark_gemini_daily_quota_exhausted(self, hn_id: int) -> None:
+        if self.gemini_daily_quota_exhausted:
+            return
+        self.gemini_daily_quota_exhausted = True
+        LOGGER.warning(
+            "Gemini daily quota exhausted during hn_id=%s. Skipping further Gemini requests for the rest of this cycle.",
+            hn_id,
+        )
 
 
 def should_refresh_comments(
