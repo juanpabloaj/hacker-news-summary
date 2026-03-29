@@ -1,11 +1,14 @@
 from __future__ import annotations
 
-import json
 import hashlib
+import json
 import logging
 import re
+import ssl
+import time
 from html import unescape
 from typing import Any
+from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from .content_fetcher import get_domain, normalize_text
@@ -16,10 +19,16 @@ LOGGER = logging.getLogger(__name__)
 HN_FRONT_PAGE_URL = "https://news.ycombinator.com/"
 HN_ITEM_API_URL = "https://hacker-news.firebaseio.com/v0/item/{item_id}.json"
 USER_AGENT = "Mozilla/5.0 (compatible; HackerNewsResumeChannel/0.1)"
+FETCH_MAX_RETRIES = 3
+RETRY_DELAY_SECONDS = 1.0
 
 
 def fetch_front_page_posts(timeout_seconds: int) -> list[FrontPagePost]:
-    html = _fetch_text(HN_FRONT_PAGE_URL, timeout_seconds)
+    try:
+        html = _fetch_text(HN_FRONT_PAGE_URL, timeout_seconds)
+    except (HTTPError, URLError):
+        LOGGER.exception("Failed to fetch Hacker News front page after retries.")
+        return []
     entries = _parse_front_page_entries(html)
     posts: list[FrontPagePost] = []
     for entry in entries:
@@ -46,7 +55,11 @@ def fetch_front_page_posts(timeout_seconds: int) -> list[FrontPagePost]:
 
 def fetch_item(item_id: int, timeout_seconds: int) -> dict[str, Any] | None:
     url = HN_ITEM_API_URL.format(item_id=item_id)
-    raw_json = _fetch_text(url, timeout_seconds)
+    try:
+        raw_json = _fetch_text(url, timeout_seconds)
+    except (HTTPError, URLError):
+        LOGGER.warning("Failed to fetch Hacker News item %s after retries.", item_id)
+        return None
     return json.loads(raw_json)
 
 
@@ -79,9 +92,33 @@ def _collect_comment_text(item_id: int, timeout_seconds: int, comments: list[str
 
 def _fetch_text(url: str, timeout_seconds: int) -> str:
     request = Request(url, headers={"User-Agent": USER_AGENT})
-    with urlopen(request, timeout=timeout_seconds) as response:
-        charset = response.headers.get_content_charset() or "utf-8"
-        return response.read().decode(charset, errors="replace")
+    for attempt in range(1, FETCH_MAX_RETRIES + 1):
+        try:
+            with urlopen(request, timeout=timeout_seconds) as response:
+                charset = response.headers.get_content_charset() or "utf-8"
+                return response.read().decode(charset, errors="replace")
+        except HTTPError as error:
+            if attempt >= FETCH_MAX_RETRIES or not _should_retry_http_error(error):
+                raise
+            LOGGER.warning(
+                "Transient HTTP error fetching %s on attempt %s/%s: %s",
+                url,
+                attempt,
+                FETCH_MAX_RETRIES,
+                error.code,
+            )
+        except URLError as error:
+            if attempt >= FETCH_MAX_RETRIES or not _should_retry_url_error(error):
+                raise
+            LOGGER.warning(
+                "Transient URL error fetching %s on attempt %s/%s: %s",
+                url,
+                attempt,
+                FETCH_MAX_RETRIES,
+                error.reason,
+            )
+        time.sleep(RETRY_DELAY_SECONDS * attempt)
+    raise RuntimeError("Unreachable retry state in Hacker News fetch client.")
 
 
 def _parse_front_page_entries(html: str) -> list[dict[str, int]]:
@@ -98,3 +135,16 @@ def _parse_front_page_entries(html: str) -> list[dict[str, int]]:
 
 def _html_to_plain(html: str) -> str:
     return re.sub(r"<[^>]+>", " ", unescape(html))
+
+
+def _should_retry_http_error(error: HTTPError) -> bool:
+    return error.code in {429, 500, 502, 503, 504}
+
+
+def _should_retry_url_error(error: URLError) -> bool:
+    reason = error.reason
+    if isinstance(reason, ssl.SSLEOFError):
+        return True
+    if isinstance(reason, TimeoutError):
+        return True
+    return True
