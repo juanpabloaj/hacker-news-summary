@@ -27,7 +27,9 @@ def main() -> int:
         gemini_client=GeminiClient(
             api_key=config.gemini_api_key or "",
             model=config.gemini_model,
-            timeout_seconds=config.request_timeout_seconds,
+            timeout_seconds=config.gemini_timeout_seconds,
+            max_retries=config.gemini_max_retries,
+            retry_delay_seconds=config.gemini_retry_delay_seconds,
         ),
         telegram_client=TelegramClient(
             bot_token=config.telegram_bot_token or "",

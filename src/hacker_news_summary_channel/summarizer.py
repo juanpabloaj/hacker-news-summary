@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import logging
+import socket
+import time
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
@@ -19,10 +21,19 @@ class GeminiDailyQuotaExceededError(GeminiError):
 
 
 class GeminiClient:
-    def __init__(self, api_key: str, model: str, timeout_seconds: int) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        timeout_seconds: int,
+        max_retries: int,
+        retry_delay_seconds: int,
+    ) -> None:
         self.api_key = api_key
         self.model = model
         self.timeout_seconds = timeout_seconds
+        self.max_retries = max_retries
+        self.retry_delay_seconds = retry_delay_seconds
 
     def summarize_article(
         self, title: str, source_url: str | None, content: str, max_chars: int
@@ -99,22 +110,41 @@ class GeminiClient:
             headers={"Content-Type": "application/json"},
             method="POST",
         )
-        try:
-            with urlopen(request, timeout=self.timeout_seconds) as response:
-                body = json.loads(response.read().decode("utf-8"))
-        except HTTPError as error:
-            detail = error.read().decode("utf-8", errors="replace")
-            LOGGER.warning("Gemini request failed with HTTP %s: %s", error.code, detail)
-            raise _classify_http_error(error.code, detail) from error
-        except URLError as error:
-            LOGGER.warning("Gemini request failed with URL error: %s", error.reason)
-            raise GeminiError(f"Gemini request failed: {error.reason}") from error
+        for attempt in range(1, self.max_retries + 2):
+            try:
+                with urlopen(request, timeout=self.timeout_seconds) as response:
+                    body = json.loads(response.read().decode("utf-8"))
+                return GeminiResponse(
+                    text=_extract_response_text(body),
+                    usage=_extract_usage(body.get("usageMetadata") or {}),
+                    response_id=body.get("responseId"),
+                )
+            except HTTPError as error:
+                detail = error.read().decode("utf-8", errors="replace")
+                LOGGER.warning("Gemini request failed with HTTP %s: %s", error.code, detail)
+                classified = _classify_http_error(error.code, detail)
+                if attempt > self.max_retries or not _should_retry_http_error(
+                    error.code, classified
+                ):
+                    raise classified from error
+            except URLError as error:
+                LOGGER.warning("Gemini request failed with URL error: %s", error.reason)
+                if attempt > self.max_retries or not _should_retry_url_error(error):
+                    raise GeminiError(f"Gemini request failed: {error.reason}") from error
+            except (TimeoutError, socket.timeout) as error:
+                LOGGER.warning("Gemini request timed out: %s", error)
+                if attempt > self.max_retries:
+                    raise GeminiError("Gemini request timed out") from error
 
-        return GeminiResponse(
-            text=_extract_response_text(body),
-            usage=_extract_usage(body.get("usageMetadata") or {}),
-            response_id=body.get("responseId"),
-        )
+            delay_seconds = self.retry_delay_seconds * attempt
+            LOGGER.info(
+                "Retrying Gemini request in %ss (attempt %s/%s).",
+                delay_seconds,
+                attempt + 1,
+                self.max_retries + 1,
+            )
+            time.sleep(delay_seconds)
+        raise RuntimeError("Unreachable retry state in Gemini client.")
 
 
 def _extract_response_text(body: dict) -> str:
@@ -156,6 +186,12 @@ def _classify_http_error(status_code: int, detail: str) -> GeminiError:
     return GeminiError(f"Gemini request failed with HTTP {status_code}")
 
 
+def _should_retry_http_error(status_code: int, error: GeminiError) -> bool:
+    if isinstance(error, GeminiDailyQuotaExceededError):
+        return False
+    return status_code in {408, 429, 500, 502, 503, 504}
+
+
 def _is_daily_quota_exceeded(parsed_detail: dict | None) -> bool:
     if not parsed_detail:
         return False
@@ -176,3 +212,8 @@ def _safe_json_loads(detail: str) -> dict | None:
     except json.JSONDecodeError:
         return None
     return loaded if isinstance(loaded, dict) else None
+
+
+def _should_retry_url_error(error: URLError) -> bool:
+    reason = error.reason
+    return isinstance(reason, (TimeoutError, socket.timeout))
