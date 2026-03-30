@@ -100,8 +100,10 @@ class PollingService:
             stats.skipped_comment_updates += 1
             LOGGER.info("Skipping comment refresh for hn_id=%s", post.hn_id)
             return
-        self._refresh_comments_message(post, record)
-        stats.comments_updates += 1
+        if self._refresh_comments_message(post, record):
+            stats.comments_updates += 1
+        else:
+            stats.skipped_comment_updates += 1
 
     def _publish_initial_messages(self, post: FrontPagePost, record: PostRecord) -> None:
         article_summary = self._generate_article_summary(post)
@@ -117,7 +119,7 @@ class PollingService:
             self.storage.set_article_message_id(post.hn_id, article_message_id)
             LOGGER.info("Published article message for hn_id=%s", post.hn_id)
 
-        comments_summary, comment_tree_hash = self._generate_comments_summary(post)
+        comments_summary, comment_tree_hash, _ = self._generate_comments_summary(post)
         comments_message_id = record.comments_message_id
         if comments_message_id is None:
             comments_message_id = self.telegram_client.send_message(
@@ -137,8 +139,14 @@ class PollingService:
             summary_text=comments_summary,
         )
 
-    def _refresh_comments_message(self, post: FrontPagePost, record: PostRecord) -> None:
-        comments_summary, comment_tree_hash = self._generate_comments_summary(post)
+    def _refresh_comments_message(self, post: FrontPagePost, record: PostRecord) -> bool:
+        comments_summary, comment_tree_hash, used_fallback = self._generate_comments_summary(post)
+        if used_fallback:
+            LOGGER.info(
+                "Skipping comments message update for hn_id=%s because comment regeneration fell back.",
+                post.hn_id,
+            )
+            return False
         if record.comments_message_id is None:
             raise RuntimeError(
                 "Cannot refresh comments message without a stored Telegram message ID."
@@ -160,6 +168,7 @@ class PollingService:
         )
         self.storage.increment_comment_update_count(post.hn_id)
         LOGGER.info("Updated comments message for hn_id=%s", post.hn_id)
+        return True
 
     def _generate_article_summary(self, post: FrontPagePost) -> str:
         latest = self.storage.get_latest_article_summary(post.hn_id)
@@ -260,7 +269,7 @@ class PollingService:
         self.storage.store_article_summary(post.hn_id, None, self.config.gemini_model, summary)
         return summary
 
-    def _generate_comments_summary(self, post: FrontPagePost) -> tuple[str, str]:
+    def _generate_comments_summary(self, post: FrontPagePost) -> tuple[str, str, bool]:
         comments_text, tree_hash = fetch_comments_text(
             item_id=post.hn_id,
             timeout_seconds=self.config.request_timeout_seconds,
@@ -269,11 +278,11 @@ class PollingService:
         latest = self.storage.get_latest_comment_summary(post.hn_id)
         if comments_text and latest and latest["comment_tree_hash"] == tree_hash:
             LOGGER.info("Reusing cached comments summary for hn_id=%s", post.hn_id)
-            return str(latest["summary_text"]), tree_hash
+            return str(latest["summary_text"]), tree_hash, False
         if not comments_text:
-            return COMMENTS_FALLBACK_SUMMARY, tree_hash
+            return COMMENTS_FALLBACK_SUMMARY, tree_hash, True
         if self.gemini_daily_quota_exhausted:
-            return COMMENTS_FALLBACK_SUMMARY, tree_hash
+            return COMMENTS_FALLBACK_SUMMARY, tree_hash, True
         try:
             response = self.gemini_client.summarize_comments(
                 post.title,
@@ -288,13 +297,16 @@ class PollingService:
                 usage=response.usage,
             )
             summary = response.text
+            used_fallback = False
         except GeminiDailyQuotaExceededError:
             self._mark_gemini_daily_quota_exhausted(post.hn_id)
             summary = COMMENTS_FALLBACK_SUMMARY
+            used_fallback = True
         except Exception:
             LOGGER.exception("Comments summary generation failed for hn_id=%s", post.hn_id)
             summary = COMMENTS_FALLBACK_SUMMARY
-        return summary, tree_hash
+            used_fallback = True
+        return summary, tree_hash, used_fallback
 
     def _mark_gemini_daily_quota_exhausted(self, hn_id: int) -> None:
         if self.gemini_daily_quota_exhausted:

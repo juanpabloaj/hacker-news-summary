@@ -26,8 +26,8 @@ class Config:
     telegram_max_message_chars: int = 4096
     request_timeout_seconds: int = 20
     gemini_timeout_seconds: int = 60
-    gemini_max_retries: int = 2
-    gemini_retry_delay_seconds: int = 2
+    gemini_max_retries: int = 4
+    gemini_retry_delay_seconds: int = 4
     article_max_chars: int = 20000
     comments_max_chars: int = 24000
     article_summary_max_chars: int = 1400
@@ -51,8 +51,8 @@ class Config:
             telegram_max_message_chars=_get_env_int("TELEGRAM_MAX_MESSAGE_CHARS", 4096),
             request_timeout_seconds=_get_env_int("REQUEST_TIMEOUT_SECONDS", 20),
             gemini_timeout_seconds=_get_env_int("GEMINI_TIMEOUT_SECONDS", 60),
-            gemini_max_retries=_get_env_int("GEMINI_MAX_RETRIES", 2),
-            gemini_retry_delay_seconds=_get_env_int("GEMINI_RETRY_DELAY_SECONDS", 2),
+            gemini_max_retries=_get_env_int("GEMINI_MAX_RETRIES", 4),
+            gemini_retry_delay_seconds=_get_env_int("GEMINI_RETRY_DELAY_SECONDS", 4),
             article_max_chars=_get_env_int("ARTICLE_MAX_CHARS", 20000),
             comments_max_chars=_get_env_int("COMMENTS_MAX_CHARS", 24000),
             article_summary_max_chars=_get_env_int("ARTICLE_SUMMARY_MAX_CHARS", 1400),
