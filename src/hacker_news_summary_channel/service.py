@@ -14,7 +14,7 @@ from .formatting import (
 from .hn_client import fetch_comments_text, fetch_front_page_posts
 from .models import FrontPagePost, PostRecord
 from .storage import Storage
-from .summarizer import GeminiClient, GeminiDailyQuotaExceededError
+from .summarizer import GeminiClient, GeminiDailyQuotaExceededError, GeminiError
 from .telegram import TelegramClient
 
 LOGGER = logging.getLogger(__name__)
@@ -218,8 +218,11 @@ class PollingService:
         except GeminiDailyQuotaExceededError:
             self._mark_gemini_daily_quota_exhausted(post.hn_id)
             summary = ARTICLE_FALLBACK_SUMMARY
+        except GeminiError as error:
+            LOGGER.warning("Article summary generation failed for hn_id=%s: %s", post.hn_id, error)
+            summary = ARTICLE_FALLBACK_SUMMARY
         except Exception:
-            LOGGER.exception("Article summary generation failed for hn_id=%s", post.hn_id)
+            LOGGER.exception("Unexpected article summary failure for hn_id=%s", post.hn_id)
             summary = ARTICLE_FALLBACK_SUMMARY
         self.storage.store_article_summary(
             post.hn_id, fetch_result.content_hash, self.config.gemini_model, summary
@@ -263,8 +266,17 @@ class PollingService:
         except GeminiDailyQuotaExceededError:
             self._mark_gemini_daily_quota_exhausted(post.hn_id)
             summary = ARTICLE_FALLBACK_SUMMARY
+        except GeminiError as error:
+            LOGGER.warning(
+                "Gemini URL-context article summary failed for hn_id=%s: %s",
+                post.hn_id,
+                error,
+            )
+            summary = ARTICLE_FALLBACK_SUMMARY
         except Exception:
-            LOGGER.exception("Gemini URL-context article summary failed for hn_id=%s", post.hn_id)
+            LOGGER.exception(
+                "Unexpected URL-context article summary failure for hn_id=%s", post.hn_id
+            )
             summary = ARTICLE_FALLBACK_SUMMARY
         self.storage.store_article_summary(post.hn_id, None, self.config.gemini_model, summary)
         return summary
@@ -302,8 +314,12 @@ class PollingService:
             self._mark_gemini_daily_quota_exhausted(post.hn_id)
             summary = COMMENTS_FALLBACK_SUMMARY
             used_fallback = True
+        except GeminiError as error:
+            LOGGER.warning("Comments summary generation failed for hn_id=%s: %s", post.hn_id, error)
+            summary = COMMENTS_FALLBACK_SUMMARY
+            used_fallback = True
         except Exception:
-            LOGGER.exception("Comments summary generation failed for hn_id=%s", post.hn_id)
+            LOGGER.exception("Unexpected comments summary failure for hn_id=%s", post.hn_id)
             summary = COMMENTS_FALLBACK_SUMMARY
             used_fallback = True
         return summary, tree_hash, used_fallback
