@@ -14,3 +14,8 @@ def test_retryable_hn_http_errors() -> None:
 def test_retryable_hn_url_ssl_eof_error() -> None:
     error = URLError(ssl.SSLEOFError("unexpected eof"))
     assert _should_retry_url_error(error)
+
+
+def test_retryable_hn_url_timeout_error() -> None:
+    error = URLError(TimeoutError("timed out"))
+    assert _should_retry_url_error(error)
