@@ -32,6 +32,20 @@ class CycleStats:
     gemini_calls: int = 0
 
 
+@dataclass(slots=True)
+class ArticleSummaryResult:
+    summary: str
+    used_fallback: bool
+    content_hash: str | None
+
+
+@dataclass(slots=True)
+class CommentsSummaryResult:
+    summary: str
+    comment_tree_hash: str
+    used_fallback: bool
+
+
 class PollingService:
     def __init__(
         self,
@@ -80,14 +94,18 @@ class PollingService:
     def _process_post(self, post: FrontPagePost, stats: CycleStats) -> None:
         stats.processed_posts += 1
         record = self.storage.upsert_post(post)
+        if self._has_partial_publication(record):
+            self._clear_partial_publication(post, record)
+            record = self.storage.get_post(post.hn_id) or record
         if record.article_message_id is None or record.comments_message_id is None:
-            self._publish_initial_messages(post, record)
-            stats.initial_publications += 1
+            if self._publish_initial_messages(post):
+                stats.initial_publications += 1
             return
         latest_comment_summary = self.storage.get_latest_comment_summary(post.hn_id)
         if latest_comment_summary is None:
-            self._publish_initial_messages(post, record)
-            stats.initial_publications += 1
+            self._clear_partial_publication(post, record)
+            if self._publish_initial_messages(post):
+                stats.initial_publications += 1
             return
         last_comment_count = int(latest_comment_summary["comment_count"])
         if not should_refresh_comments(
@@ -105,43 +123,60 @@ class PollingService:
         else:
             stats.skipped_comment_updates += 1
 
-    def _publish_initial_messages(self, post: FrontPagePost, record: PostRecord) -> None:
-        article_summary = self._generate_article_summary(post)
-        article_message_id = record.article_message_id
-        if article_message_id is None:
+    def _publish_initial_messages(self, post: FrontPagePost) -> bool:
+        article_result = self._generate_article_summary(post)
+        comments_result = self._generate_comments_summary(post)
+        if article_result.used_fallback or comments_result.used_fallback:
+            LOGGER.info(
+                "Deferring Telegram publication for hn_id=%s until both summaries are available.",
+                post.hn_id,
+            )
+            self.storage.clear_publication_state(post.hn_id)
+            return False
+
+        article_message_id: int | None = None
+        try:
             article_message_id = self.telegram_client.send_message(
                 format_article_message(
                     post,
-                    article_summary,
+                    article_result.summary,
                     max_chars=self.config.telegram_max_message_chars,
                 )
             )
-            self.storage.set_article_message_id(post.hn_id, article_message_id)
-            LOGGER.info("Published article message for hn_id=%s", post.hn_id)
-
-        comments_summary, comment_tree_hash, _ = self._generate_comments_summary(post)
-        comments_message_id = record.comments_message_id
-        if comments_message_id is None:
             comments_message_id = self.telegram_client.send_message(
                 format_comments_message(
                     post,
-                    comments_summary,
+                    comments_result.summary,
                     max_chars=self.config.telegram_max_message_chars,
                 )
             )
-            self.storage.set_comments_message_id(post.hn_id, comments_message_id)
-            LOGGER.info("Published comments message for hn_id=%s", post.hn_id)
+        except Exception:
+            if article_message_id is not None:
+                self._delete_message_best_effort(post.hn_id, article_message_id)
+            self.storage.clear_publication_state(post.hn_id)
+            raise
+
+        self.storage.set_article_message_id(post.hn_id, article_message_id)
+        self.storage.set_comments_message_id(post.hn_id, comments_message_id)
+        self.storage.store_article_summary(
+            post.hn_id,
+            article_result.content_hash,
+            self.config.gemini_model,
+            article_result.summary,
+        )
         self.storage.store_comment_summary(
             post.hn_id,
-            comment_tree_hash=comment_tree_hash,
+            comment_tree_hash=comments_result.comment_tree_hash,
             comment_count=post.comment_count,
             model_name=self.config.gemini_model,
-            summary_text=comments_summary,
+            summary_text=comments_result.summary,
         )
+        LOGGER.info("Published article and comments messages for hn_id=%s", post.hn_id)
+        return True
 
     def _refresh_comments_message(self, post: FrontPagePost, record: PostRecord) -> bool:
-        comments_summary, comment_tree_hash, used_fallback = self._generate_comments_summary(post)
-        if used_fallback:
+        comments_result = self._generate_comments_summary(post)
+        if comments_result.used_fallback:
             LOGGER.info(
                 "Skipping comments message update for hn_id=%s because comment regeneration fell back.",
                 post.hn_id,
@@ -155,22 +190,22 @@ class PollingService:
             record.comments_message_id,
             format_comments_message(
                 post,
-                comments_summary,
+                comments_result.summary,
                 max_chars=self.config.telegram_max_message_chars,
             ),
         )
         self.storage.store_comment_summary(
             post.hn_id,
-            comment_tree_hash=comment_tree_hash,
+            comment_tree_hash=comments_result.comment_tree_hash,
             comment_count=post.comment_count,
             model_name=self.config.gemini_model,
-            summary_text=comments_summary,
+            summary_text=comments_result.summary,
         )
         self.storage.increment_comment_update_count(post.hn_id)
         LOGGER.info("Updated comments message for hn_id=%s", post.hn_id)
         return True
 
-    def _generate_article_summary(self, post: FrontPagePost) -> str:
+    def _generate_article_summary(self, post: FrontPagePost) -> ArticleSummaryResult:
         latest = self.storage.get_latest_article_summary(post.hn_id)
         fetch_result = fetch_article_or_text(
             url=post.url,
@@ -189,17 +224,21 @@ class PollingService:
         )
         if fetch_result.content and latest and latest["content_hash"] == fetch_result.content_hash:
             LOGGER.info("Reusing cached article summary for hn_id=%s", post.hn_id)
-            return str(latest["summary_text"])
+            return ArticleSummaryResult(
+                summary=str(latest["summary_text"]),
+                used_fallback=False,
+                content_hash=fetch_result.content_hash,
+            )
         if not fetch_result.content:
             return self._generate_article_summary_from_url_fallback(
                 post, local_fetch_error=fetch_result.error_message
             )
         if self.gemini_daily_quota_exhausted:
-            summary = ARTICLE_FALLBACK_SUMMARY
-            self.storage.store_article_summary(
-                post.hn_id, fetch_result.content_hash, self.config.gemini_model, summary
+            return ArticleSummaryResult(
+                summary=ARTICLE_FALLBACK_SUMMARY,
+                used_fallback=True,
+                content_hash=fetch_result.content_hash,
             )
-            return summary
         try:
             response = self.gemini_client.summarize_article(
                 post.title,
@@ -214,28 +253,42 @@ class PollingService:
                 response_id=response.response_id,
                 usage=response.usage,
             )
-            summary = response.text
+            return ArticleSummaryResult(
+                summary=response.text,
+                used_fallback=False,
+                content_hash=fetch_result.content_hash,
+            )
         except GeminiDailyQuotaExceededError:
             self._mark_gemini_daily_quota_exhausted(post.hn_id)
-            summary = ARTICLE_FALLBACK_SUMMARY
+            return ArticleSummaryResult(
+                summary=ARTICLE_FALLBACK_SUMMARY,
+                used_fallback=True,
+                content_hash=fetch_result.content_hash,
+            )
         except GeminiError as error:
             LOGGER.warning("Article summary generation failed for hn_id=%s: %s", post.hn_id, error)
-            summary = ARTICLE_FALLBACK_SUMMARY
+            return ArticleSummaryResult(
+                summary=ARTICLE_FALLBACK_SUMMARY,
+                used_fallback=True,
+                content_hash=fetch_result.content_hash,
+            )
         except Exception:
             LOGGER.exception("Unexpected article summary failure for hn_id=%s", post.hn_id)
-            summary = ARTICLE_FALLBACK_SUMMARY
-        self.storage.store_article_summary(
-            post.hn_id, fetch_result.content_hash, self.config.gemini_model, summary
-        )
-        return summary
+            return ArticleSummaryResult(
+                summary=ARTICLE_FALLBACK_SUMMARY,
+                used_fallback=True,
+                content_hash=fetch_result.content_hash,
+            )
 
     def _generate_article_summary_from_url_fallback(
         self, post: FrontPagePost, local_fetch_error: str | None
-    ) -> str:
+    ) -> ArticleSummaryResult:
         if not post.url:
-            summary = ARTICLE_FALLBACK_SUMMARY
-            self.storage.store_article_summary(post.hn_id, None, self.config.gemini_model, summary)
-            return summary
+            return ArticleSummaryResult(
+                summary=ARTICLE_FALLBACK_SUMMARY,
+                used_fallback=True,
+                content_hash=None,
+            )
         self.storage.store_article_fetch(
             post.hn_id,
             fetch_method="gemini_url_context",
@@ -246,9 +299,11 @@ class PollingService:
             error_message=local_fetch_error,
         )
         if self.gemini_daily_quota_exhausted:
-            summary = ARTICLE_FALLBACK_SUMMARY
-            self.storage.store_article_summary(post.hn_id, None, self.config.gemini_model, summary)
-            return summary
+            return ArticleSummaryResult(
+                summary=ARTICLE_FALLBACK_SUMMARY,
+                used_fallback=True,
+                content_hash=None,
+            )
         try:
             response = self.gemini_client.summarize_article_from_url(
                 post.title,
@@ -262,26 +317,40 @@ class PollingService:
                 response_id=response.response_id,
                 usage=response.usage,
             )
-            summary = response.text
+            return ArticleSummaryResult(
+                summary=response.text,
+                used_fallback=False,
+                content_hash=None,
+            )
         except GeminiDailyQuotaExceededError:
             self._mark_gemini_daily_quota_exhausted(post.hn_id)
-            summary = ARTICLE_FALLBACK_SUMMARY
+            return ArticleSummaryResult(
+                summary=ARTICLE_FALLBACK_SUMMARY,
+                used_fallback=True,
+                content_hash=None,
+            )
         except GeminiError as error:
             LOGGER.warning(
                 "Gemini URL-context article summary failed for hn_id=%s: %s",
                 post.hn_id,
                 error,
             )
-            summary = ARTICLE_FALLBACK_SUMMARY
+            return ArticleSummaryResult(
+                summary=ARTICLE_FALLBACK_SUMMARY,
+                used_fallback=True,
+                content_hash=None,
+            )
         except Exception:
             LOGGER.exception(
                 "Unexpected URL-context article summary failure for hn_id=%s", post.hn_id
             )
-            summary = ARTICLE_FALLBACK_SUMMARY
-        self.storage.store_article_summary(post.hn_id, None, self.config.gemini_model, summary)
-        return summary
+            return ArticleSummaryResult(
+                summary=ARTICLE_FALLBACK_SUMMARY,
+                used_fallback=True,
+                content_hash=None,
+            )
 
-    def _generate_comments_summary(self, post: FrontPagePost) -> tuple[str, str, bool]:
+    def _generate_comments_summary(self, post: FrontPagePost) -> CommentsSummaryResult:
         comments_text, tree_hash = fetch_comments_text(
             item_id=post.hn_id,
             timeout_seconds=self.config.request_timeout_seconds,
@@ -290,11 +359,23 @@ class PollingService:
         latest = self.storage.get_latest_comment_summary(post.hn_id)
         if comments_text and latest and latest["comment_tree_hash"] == tree_hash:
             LOGGER.info("Reusing cached comments summary for hn_id=%s", post.hn_id)
-            return str(latest["summary_text"]), tree_hash, False
+            return CommentsSummaryResult(
+                summary=str(latest["summary_text"]),
+                comment_tree_hash=tree_hash,
+                used_fallback=False,
+            )
         if not comments_text:
-            return COMMENTS_FALLBACK_SUMMARY, tree_hash, True
+            return CommentsSummaryResult(
+                summary=COMMENTS_FALLBACK_SUMMARY,
+                comment_tree_hash=tree_hash,
+                used_fallback=True,
+            )
         if self.gemini_daily_quota_exhausted:
-            return COMMENTS_FALLBACK_SUMMARY, tree_hash, True
+            return CommentsSummaryResult(
+                summary=COMMENTS_FALLBACK_SUMMARY,
+                comment_tree_hash=tree_hash,
+                used_fallback=True,
+            )
         try:
             response = self.gemini_client.summarize_comments(
                 post.title,
@@ -308,21 +389,54 @@ class PollingService:
                 response_id=response.response_id,
                 usage=response.usage,
             )
-            summary = response.text
-            used_fallback = False
+            return CommentsSummaryResult(
+                summary=response.text,
+                comment_tree_hash=tree_hash,
+                used_fallback=False,
+            )
         except GeminiDailyQuotaExceededError:
             self._mark_gemini_daily_quota_exhausted(post.hn_id)
-            summary = COMMENTS_FALLBACK_SUMMARY
-            used_fallback = True
+            return CommentsSummaryResult(
+                summary=COMMENTS_FALLBACK_SUMMARY,
+                comment_tree_hash=tree_hash,
+                used_fallback=True,
+            )
         except GeminiError as error:
             LOGGER.warning("Comments summary generation failed for hn_id=%s: %s", post.hn_id, error)
-            summary = COMMENTS_FALLBACK_SUMMARY
-            used_fallback = True
+            return CommentsSummaryResult(
+                summary=COMMENTS_FALLBACK_SUMMARY,
+                comment_tree_hash=tree_hash,
+                used_fallback=True,
+            )
         except Exception:
             LOGGER.exception("Unexpected comments summary failure for hn_id=%s", post.hn_id)
-            summary = COMMENTS_FALLBACK_SUMMARY
-            used_fallback = True
-        return summary, tree_hash, used_fallback
+            return CommentsSummaryResult(
+                summary=COMMENTS_FALLBACK_SUMMARY,
+                comment_tree_hash=tree_hash,
+                used_fallback=True,
+            )
+
+    def _clear_partial_publication(self, post: FrontPagePost, record: PostRecord) -> None:
+        if record.article_message_id is not None:
+            self._delete_message_best_effort(post.hn_id, record.article_message_id)
+        if record.comments_message_id is not None:
+            self._delete_message_best_effort(post.hn_id, record.comments_message_id)
+        self.storage.clear_publication_state(post.hn_id)
+        LOGGER.warning("Cleared partial Telegram publication state for hn_id=%s", post.hn_id)
+
+    def _delete_message_best_effort(self, hn_id: int, message_id: int) -> None:
+        try:
+            self.telegram_client.delete_message(message_id)
+        except Exception as error:
+            LOGGER.warning(
+                "Failed to delete Telegram message_id=%s for hn_id=%s: %s",
+                message_id,
+                hn_id,
+                error,
+            )
+
+    def _has_partial_publication(self, record: PostRecord) -> bool:
+        return (record.article_message_id is None) != (record.comments_message_id is None)
 
     def _mark_gemini_daily_quota_exhausted(self, hn_id: int) -> None:
         if self.gemini_daily_quota_exhausted:

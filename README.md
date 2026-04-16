@@ -65,6 +65,7 @@ On each cycle, the service:
 4. Publishes two Telegram messages for new qualifying posts:
    - one article summary message
    - one comments summary message
+   - only after both summaries have been generated successfully
 5. Edits only the comments message when the comment increase reaches `COMMENT_RESUMMARY_THRESHOLD`.
 6. Marks posts as inactive when they leave the front page.
 
@@ -74,7 +75,7 @@ For article content, the service uses a hybrid strategy:
 - Gemini URL context as a fallback if local extraction fails and a URL exists
 - article-summary fallback text if both fail
 
-If Gemini daily quota is exhausted, the service stops making new Gemini requests for the rest of the current cycle and falls back gracefully.
+If Gemini daily quota is exhausted, the service stops making new Gemini requests for the rest of the current cycle and falls back gracefully. Initial publications are deferred until both summaries are available; fallback placeholder summaries are not published for new posts.
 
 ## Telegram Output
 
@@ -88,16 +89,6 @@ example.com • 187 points • 64 comments
 https://news.ycombinator.com/item?id=12345678
 
 <summary>
-```
-
-Article fallback:
-
-```text
-Example Post Title
-example.com • 187 points • 64 comments
-https://news.ycombinator.com/item?id=12345678
-
-<could not generate article summary>
 ```
 
 Comments message:
@@ -137,8 +128,9 @@ The service logs:
 Expected failures are handled defensively:
 
 - article fetch failures do not block comment summaries
-- Gemini failures fall back to placeholder summary text
+- Gemini failures fall back internally and defer initial publication to a later cycle
 - duplicate Telegram publications are avoided through SQLite state
+- partial initial Telegram publications are rolled back if the second send fails
 - one post failure does not stop the rest of the cycle
 
 ## Execution

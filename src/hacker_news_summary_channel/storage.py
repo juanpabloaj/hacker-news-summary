@@ -190,6 +190,19 @@ class Storage:
                 (hn_id,),
             )
 
+    def clear_publication_state(self, hn_id: int) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE posts
+                SET article_message_id = NULL,
+                    comments_message_id = NULL,
+                    comment_update_count = 0
+                WHERE hn_id = ?
+                """,
+                (hn_id,),
+            )
+
     def store_article_summary(
         self, hn_id: int, content_hash: str | None, model_name: str, summary_text: str
     ) -> None:

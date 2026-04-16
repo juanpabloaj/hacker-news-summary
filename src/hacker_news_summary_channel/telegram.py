@@ -48,7 +48,14 @@ class TelegramClient:
         }
         self._post("editMessageText", payload)
 
-    def _post(self, method: str, payload: dict[str, object]) -> dict[str, object]:
+    def delete_message(self, message_id: int) -> None:
+        payload = {
+            "chat_id": self.channel_id,
+            "message_id": message_id,
+        }
+        self._post("deleteMessage", payload)
+
+    def _post(self, method: str, payload: dict[str, object]) -> dict[str, object] | bool:
         data = urlencode(payload).encode("utf-8")
         request = Request(f"{self.base_url}/{method}", data=data, method="POST")
         try:
@@ -64,6 +71,8 @@ class TelegramClient:
         if not body.get("ok"):
             raise RuntimeError(f"Telegram request failed: {body}")
         result = body.get("result")
+        if isinstance(result, bool):
+            return result
         if not isinstance(result, dict):
             raise RuntimeError(f"Telegram request returned unexpected payload: {body}")
         return result
