@@ -1,11 +1,13 @@
 from hacker_news_summary_channel.models import GeminiUsage
 from hacker_news_summary_channel.service import (
     CycleStats,
+    PollingService,
     _format_cycle_stats,
     _format_usage_log,
     _usage_delta,
     should_refresh_comments,
 )
+from hacker_news_summary_channel.summarizer import GeminiTransientError
 
 
 def test_should_refresh_comments_when_threshold_is_met() -> None:
@@ -66,3 +68,47 @@ def test_cycle_stats_formatting() -> None:
         "initial_publications=4, comments_updates=2, skipped_comment_updates=4, "
         "failures=1, gemini_calls=9"
     )
+
+
+def test_circuit_breaker_trips_after_consecutive_transient_failures() -> None:
+    config = type(
+        "ConfigStub",
+        (),
+        {"gemini_transient_failure_limit_per_cycle": 3},
+    )()
+    service = PollingService(
+        config=config,
+        storage=object(),
+        gemini_client=object(),
+        telegram_client=object(),
+    )
+
+    service._mark_gemini_transient_failure(1001, GeminiTransientError("503"))
+    assert not service.gemini_temporarily_unavailable
+    service._mark_gemini_transient_failure(1002, GeminiTransientError("503"))
+    assert not service.gemini_temporarily_unavailable
+    service._mark_gemini_transient_failure(1003, GeminiTransientError("503"))
+
+    assert service.gemini_temporarily_unavailable
+    assert service._should_skip_gemini_requests()
+
+
+def test_transient_failure_counter_resets_after_gemini_success() -> None:
+    config = type(
+        "ConfigStub",
+        (),
+        {"gemini_transient_failure_limit_per_cycle": 3},
+    )()
+    service = PollingService(
+        config=config,
+        storage=object(),
+        gemini_client=object(),
+        telegram_client=object(),
+    )
+
+    service._mark_gemini_transient_failure(1001, GeminiTransientError("503"))
+    service._mark_gemini_transient_failure(1002, GeminiTransientError("503"))
+    service._mark_gemini_success()
+
+    assert service.gemini_consecutive_transient_failures == 0
+    assert not service.gemini_temporarily_unavailable

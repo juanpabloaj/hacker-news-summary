@@ -2,6 +2,8 @@ from urllib.error import URLError
 
 from hacker_news_summary_channel.summarizer import (
     GeminiDailyQuotaExceededError,
+    GeminiTransientError,
+    _classify_http_error,
     _is_daily_quota_exceeded,
     _should_retry_http_error,
     _should_retry_url_error,
@@ -32,3 +34,8 @@ def test_daily_quota_error_is_not_retryable() -> None:
 
 def test_timeout_url_error_is_retryable() -> None:
     assert _should_retry_url_error(URLError(TimeoutError("timed out")))
+
+
+def test_503_is_classified_as_transient_error() -> None:
+    error = _classify_http_error(503, '{"error":{"code":503}}')
+    assert isinstance(error, GeminiTransientError)

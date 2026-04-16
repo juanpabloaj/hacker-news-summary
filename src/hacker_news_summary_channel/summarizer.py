@@ -20,6 +20,10 @@ class GeminiDailyQuotaExceededError(GeminiError):
     """Raised when the model daily request quota is exhausted."""
 
 
+class GeminiTransientError(GeminiError):
+    """Raised when the request failed due to a transient Gemini outage or timeout."""
+
+
 class GeminiClient:
     def __init__(
         self,
@@ -130,11 +134,11 @@ class GeminiClient:
             except URLError as error:
                 LOGGER.warning("Gemini request failed with URL error: %s", error.reason)
                 if attempt > self.max_retries or not _should_retry_url_error(error):
-                    raise GeminiError(f"Gemini request failed: {error.reason}") from error
+                    raise GeminiTransientError(f"Gemini request failed: {error.reason}") from error
             except (TimeoutError, socket.timeout) as error:
                 LOGGER.warning("Gemini request timed out: %s", error)
                 if attempt > self.max_retries:
-                    raise GeminiError("Gemini request timed out") from error
+                    raise GeminiTransientError("Gemini request timed out") from error
 
             delay_seconds = self.retry_delay_seconds * attempt
             LOGGER.info(
@@ -183,6 +187,8 @@ def _classify_http_error(status_code: int, detail: str) -> GeminiError:
         return GeminiDailyQuotaExceededError(
             f"Gemini daily quota exhausted for the configured model: HTTP {status_code}"
         )
+    if status_code in {408, 429, 500, 502, 503, 504}:
+        return GeminiTransientError(f"Gemini request failed with HTTP {status_code}")
     return GeminiError(f"Gemini request failed with HTTP {status_code}")
 
 

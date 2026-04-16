@@ -41,6 +41,7 @@ REQUEST_TIMEOUT_SECONDS=20
 GEMINI_TIMEOUT_SECONDS=60
 GEMINI_MAX_RETRIES=4
 GEMINI_RETRY_DELAY_SECONDS=4
+GEMINI_TRANSIENT_FAILURE_LIMIT_PER_CYCLE=3
 ARTICLE_MAX_CHARS=20000
 COMMENTS_MAX_CHARS=24000
 ARTICLE_SUMMARY_MAX_CHARS=1400
@@ -75,7 +76,7 @@ For article content, the service uses a hybrid strategy:
 - Gemini URL context as a fallback if local extraction fails and a URL exists
 - article-summary fallback text if both fail
 
-If Gemini daily quota is exhausted, the service stops making new Gemini requests for the rest of the current cycle and falls back gracefully. Initial publications are deferred until both summaries are available; fallback placeholder summaries are not published for new posts.
+If Gemini daily quota is exhausted, the service stops making new Gemini requests for the rest of the current cycle and falls back gracefully. The service also stops making further Gemini requests for the rest of the cycle after too many consecutive transient Gemini failures such as `503` responses or timeouts. Initial publications are deferred until both summaries are available; fallback placeholder summaries are not published for new posts.
 
 ## Telegram Output
 
@@ -129,6 +130,7 @@ Expected failures are handled defensively:
 
 - article fetch failures do not block comment summaries
 - Gemini failures fall back internally and defer initial publication to a later cycle
+- repeated transient Gemini failures trip a per-cycle circuit breaker to avoid wasting time on more requests
 - duplicate Telegram publications are avoided through SQLite state
 - partial initial Telegram publications are rolled back if the second send fails
 - one post failure does not stop the rest of the cycle

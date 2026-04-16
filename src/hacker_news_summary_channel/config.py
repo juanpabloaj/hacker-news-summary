@@ -28,6 +28,7 @@ class Config:
     gemini_timeout_seconds: int = 60
     gemini_max_retries: int = 4
     gemini_retry_delay_seconds: int = 4
+    gemini_transient_failure_limit_per_cycle: int = 3
     article_max_chars: int = 20000
     comments_max_chars: int = 24000
     article_summary_max_chars: int = 1400
@@ -53,6 +54,9 @@ class Config:
             gemini_timeout_seconds=_get_env_int("GEMINI_TIMEOUT_SECONDS", 60),
             gemini_max_retries=_get_env_int("GEMINI_MAX_RETRIES", 4),
             gemini_retry_delay_seconds=_get_env_int("GEMINI_RETRY_DELAY_SECONDS", 4),
+            gemini_transient_failure_limit_per_cycle=_get_env_int(
+                "GEMINI_TRANSIENT_FAILURE_LIMIT_PER_CYCLE", 3
+            ),
             article_max_chars=_get_env_int("ARTICLE_MAX_CHARS", 20000),
             comments_max_chars=_get_env_int("COMMENTS_MAX_CHARS", 24000),
             article_summary_max_chars=_get_env_int("ARTICLE_SUMMARY_MAX_CHARS", 1400),
@@ -84,6 +88,10 @@ class Config:
         logger.info("  gemini_timeout_seconds: %s", self.gemini_timeout_seconds)
         logger.info("  gemini_max_retries: %s", self.gemini_max_retries)
         logger.info("  gemini_retry_delay_seconds: %s", self.gemini_retry_delay_seconds)
+        logger.info(
+            "  gemini_transient_failure_limit_per_cycle: %s",
+            self.gemini_transient_failure_limit_per_cycle,
+        )
         logger.info("  article_max_chars: %s", self.article_max_chars)
         logger.info("  comments_max_chars: %s", self.comments_max_chars)
         logger.info("  article_summary_max_chars: %s", self.article_summary_max_chars)

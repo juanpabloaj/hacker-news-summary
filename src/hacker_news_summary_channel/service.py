@@ -14,7 +14,12 @@ from .formatting import (
 from .hn_client import fetch_comments_text, fetch_front_page_posts
 from .models import FrontPagePost, PostRecord
 from .storage import Storage
-from .summarizer import GeminiClient, GeminiDailyQuotaExceededError, GeminiError
+from .summarizer import (
+    GeminiClient,
+    GeminiDailyQuotaExceededError,
+    GeminiError,
+    GeminiTransientError,
+)
 from .telegram import TelegramClient
 
 LOGGER = logging.getLogger(__name__)
@@ -59,10 +64,14 @@ class PollingService:
         self.gemini_client = gemini_client
         self.telegram_client = telegram_client
         self.gemini_daily_quota_exhausted = False
+        self.gemini_temporarily_unavailable = False
+        self.gemini_consecutive_transient_failures = 0
 
     def run_cycle(self) -> None:
         self.storage.initialize()
         self.gemini_daily_quota_exhausted = False
+        self.gemini_temporarily_unavailable = False
+        self.gemini_consecutive_transient_failures = 0
         stats = CycleStats()
         usage_before = self.storage.get_gemini_usage_totals()
         gemini_calls_before = self.storage.get_gemini_call_count()
@@ -233,7 +242,7 @@ class PollingService:
             return self._generate_article_summary_from_url_fallback(
                 post, local_fetch_error=fetch_result.error_message
             )
-        if self.gemini_daily_quota_exhausted:
+        if self._should_skip_gemini_requests():
             return ArticleSummaryResult(
                 summary=ARTICLE_FALLBACK_SUMMARY,
                 used_fallback=True,
@@ -253,6 +262,7 @@ class PollingService:
                 response_id=response.response_id,
                 usage=response.usage,
             )
+            self._mark_gemini_success()
             return ArticleSummaryResult(
                 summary=response.text,
                 used_fallback=False,
@@ -260,6 +270,14 @@ class PollingService:
             )
         except GeminiDailyQuotaExceededError:
             self._mark_gemini_daily_quota_exhausted(post.hn_id)
+            return ArticleSummaryResult(
+                summary=ARTICLE_FALLBACK_SUMMARY,
+                used_fallback=True,
+                content_hash=fetch_result.content_hash,
+            )
+        except GeminiTransientError as error:
+            self._mark_gemini_transient_failure(post.hn_id, error)
+            LOGGER.warning("Article summary generation failed for hn_id=%s: %s", post.hn_id, error)
             return ArticleSummaryResult(
                 summary=ARTICLE_FALLBACK_SUMMARY,
                 used_fallback=True,
@@ -298,7 +316,7 @@ class PollingService:
             content_hash=None,
             error_message=local_fetch_error,
         )
-        if self.gemini_daily_quota_exhausted:
+        if self._should_skip_gemini_requests():
             return ArticleSummaryResult(
                 summary=ARTICLE_FALLBACK_SUMMARY,
                 used_fallback=True,
@@ -317,6 +335,7 @@ class PollingService:
                 response_id=response.response_id,
                 usage=response.usage,
             )
+            self._mark_gemini_success()
             return ArticleSummaryResult(
                 summary=response.text,
                 used_fallback=False,
@@ -324,6 +343,18 @@ class PollingService:
             )
         except GeminiDailyQuotaExceededError:
             self._mark_gemini_daily_quota_exhausted(post.hn_id)
+            return ArticleSummaryResult(
+                summary=ARTICLE_FALLBACK_SUMMARY,
+                used_fallback=True,
+                content_hash=None,
+            )
+        except GeminiTransientError as error:
+            self._mark_gemini_transient_failure(post.hn_id, error)
+            LOGGER.warning(
+                "Gemini URL-context article summary failed for hn_id=%s: %s",
+                post.hn_id,
+                error,
+            )
             return ArticleSummaryResult(
                 summary=ARTICLE_FALLBACK_SUMMARY,
                 used_fallback=True,
@@ -370,7 +401,7 @@ class PollingService:
                 comment_tree_hash=tree_hash,
                 used_fallback=True,
             )
-        if self.gemini_daily_quota_exhausted:
+        if self._should_skip_gemini_requests():
             return CommentsSummaryResult(
                 summary=COMMENTS_FALLBACK_SUMMARY,
                 comment_tree_hash=tree_hash,
@@ -389,6 +420,7 @@ class PollingService:
                 response_id=response.response_id,
                 usage=response.usage,
             )
+            self._mark_gemini_success()
             return CommentsSummaryResult(
                 summary=response.text,
                 comment_tree_hash=tree_hash,
@@ -396,6 +428,14 @@ class PollingService:
             )
         except GeminiDailyQuotaExceededError:
             self._mark_gemini_daily_quota_exhausted(post.hn_id)
+            return CommentsSummaryResult(
+                summary=COMMENTS_FALLBACK_SUMMARY,
+                comment_tree_hash=tree_hash,
+                used_fallback=True,
+            )
+        except GeminiTransientError as error:
+            self._mark_gemini_transient_failure(post.hn_id, error)
+            LOGGER.warning("Comments summary generation failed for hn_id=%s: %s", post.hn_id, error)
             return CommentsSummaryResult(
                 summary=COMMENTS_FALLBACK_SUMMARY,
                 comment_tree_hash=tree_hash,
@@ -446,6 +486,34 @@ class PollingService:
             "Gemini daily quota exhausted during hn_id=%s. Skipping further Gemini requests for the rest of this cycle.",
             hn_id,
         )
+
+    def _mark_gemini_success(self) -> None:
+        self.gemini_consecutive_transient_failures = 0
+
+    def _mark_gemini_transient_failure(self, hn_id: int, error: GeminiTransientError) -> None:
+        self.gemini_consecutive_transient_failures += 1
+        if self.gemini_temporarily_unavailable:
+            return
+        if (
+            self.gemini_consecutive_transient_failures
+            < self.config.gemini_transient_failure_limit_per_cycle
+        ):
+            LOGGER.info(
+                "Gemini transient failure count is now %s/%s for this cycle (hn_id=%s, error=%s).",
+                self.gemini_consecutive_transient_failures,
+                self.config.gemini_transient_failure_limit_per_cycle,
+                hn_id,
+                error,
+            )
+            return
+        self.gemini_temporarily_unavailable = True
+        LOGGER.warning(
+            "Gemini transient failure limit reached during hn_id=%s. Skipping further Gemini requests for the rest of this cycle.",
+            hn_id,
+        )
+
+    def _should_skip_gemini_requests(self) -> bool:
+        return self.gemini_daily_quota_exhausted or self.gemini_temporarily_unavailable
 
 
 def should_refresh_comments(
