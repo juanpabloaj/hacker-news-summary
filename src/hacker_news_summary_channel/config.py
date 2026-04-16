@@ -68,8 +68,9 @@ class Config:
             format="%(asctime)s %(levelname)s %(name)s %(message)s",
         )
 
-    def log_effective_configuration(self, logger: logging.Logger) -> None:
+    def log_effective_configuration(self, logger: logging.Logger, version: str) -> None:
         logger.info("Configuration:")
+        logger.info("  version: %s", version)
         logger.info("  poll_interval_minutes: %s", self.poll_interval_minutes)
         logger.info("  hn_min_points: %s", self.hn_min_points)
         logger.info("  comment_resummary_threshold: %s", self.comment_resummary_threshold)

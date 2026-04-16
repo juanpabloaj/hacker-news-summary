@@ -7,6 +7,11 @@ and this project follows semantic versioning for repository tags.
 
 ## [Unreleased]
 
+### Changed
+
+- Bumped the package version to `0.2.1`.
+- Logged the current service version at startup together with the effective configuration.
+
 ## [0.2.0] - 2026-04-16
 
 ### Changed

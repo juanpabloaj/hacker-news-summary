@@ -3,6 +3,7 @@ from __future__ import annotations
 import logging
 import sys
 
+from . import get_version
 from .config import Config
 from .service import PollingService
 from .storage import Storage
@@ -14,7 +15,9 @@ def main() -> int:
     config = Config.from_env()
     config.configure_logging()
     logger = logging.getLogger(__name__)
-    config.log_effective_configuration(logger)
+    current_version = get_version()
+    logger.info("Starting hacker_news_summary_channel %s", current_version)
+    config.log_effective_configuration(logger, current_version)
     try:
         config.validate()
     except ValueError as error:
