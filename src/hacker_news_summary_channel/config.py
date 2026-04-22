@@ -13,6 +13,25 @@ def _get_env_int(name: str, default: int) -> int:
     return int(raw_value)
 
 
+_TRUE_VALUES = {"1", "true", "yes", "on"}
+_FALSE_VALUES = {"0", "false", "no", "off"}
+
+
+def _get_env_bool(name: str, default: bool) -> bool:
+    raw_value = os.getenv(name)
+    if raw_value is None or raw_value.strip() == "":
+        return default
+    normalized = raw_value.strip().lower()
+    if normalized in _TRUE_VALUES:
+        return True
+    if normalized in _FALSE_VALUES:
+        return False
+    raise ValueError(
+        f"Invalid boolean value for {name}: {raw_value!r}. "
+        f"Expected one of {sorted(_TRUE_VALUES | _FALSE_VALUES)}."
+    )
+
+
 @dataclass(slots=True)
 class Config:
     poll_interval_minutes: int = 60
@@ -24,6 +43,7 @@ class Config:
     log_level: str = "INFO"
     telegram_parse_mode: str = "HTML"
     telegram_max_message_chars: int = 4096
+    telegram_expandable_summaries: bool = True
     request_timeout_seconds: int = 20
     gemini_timeout_seconds: int = 60
     gemini_max_retries: int = 4
@@ -50,6 +70,7 @@ class Config:
             log_level=os.getenv("LOG_LEVEL", "INFO").upper(),
             telegram_parse_mode=os.getenv("TELEGRAM_PARSE_MODE", "HTML"),
             telegram_max_message_chars=_get_env_int("TELEGRAM_MAX_MESSAGE_CHARS", 4096),
+            telegram_expandable_summaries=_get_env_bool("TELEGRAM_EXPANDABLE_SUMMARIES", True),
             request_timeout_seconds=_get_env_int("REQUEST_TIMEOUT_SECONDS", 20),
             gemini_timeout_seconds=_get_env_int("GEMINI_TIMEOUT_SECONDS", 60),
             gemini_max_retries=_get_env_int("GEMINI_MAX_RETRIES", 4),
@@ -84,6 +105,7 @@ class Config:
         logger.info("  log_level: %s", self.log_level)
         logger.info("  telegram_parse_mode: %s", self.telegram_parse_mode)
         logger.info("  telegram_max_message_chars: %s", self.telegram_max_message_chars)
+        logger.info("  telegram_expandable_summaries: %s", self.telegram_expandable_summaries)
         logger.info("  request_timeout_seconds: %s", self.request_timeout_seconds)
         logger.info("  gemini_timeout_seconds: %s", self.gemini_timeout_seconds)
         logger.info("  gemini_max_retries: %s", self.gemini_max_retries)

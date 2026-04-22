@@ -37,6 +37,7 @@ DB_PATH=data/app.db
 LOG_LEVEL=INFO
 TELEGRAM_PARSE_MODE=HTML
 TELEGRAM_MAX_MESSAGE_CHARS=4096
+TELEGRAM_EXPANDABLE_SUMMARIES=true
 REQUEST_TIMEOUT_SECONDS=20
 GEMINI_TIMEOUT_SECONDS=60
 GEMINI_MAX_RETRIES=4
@@ -102,6 +103,8 @@ https://news.ycombinator.com/item?id=12345678
 ```
 
 The service enforces Telegram's message-size limit and sanitizes summaries to remove Markdown-style formatting that hurts readability in Telegram.
+
+When `TELEGRAM_EXPANDABLE_SUMMARIES=true` (default), the summary body of both messages is wrapped in an expandable blockquote (`<blockquote expandable>…</blockquote>`). Telegram clients collapse the quote to the first few lines and show an "Expand" control so readers can scan headers and open only the summaries they care about. Set `TELEGRAM_EXPANDABLE_SUMMARIES=false` to emit plain summaries instead. Accepted values: `true`/`false`, `1`/`0`, `yes`/`no`, `on`/`off` (case-insensitive). Requires Telegram clients from Bot API 7.0 (Feb 2024) or later for the collapse behavior; older clients render it as a normal blockquote.
 
 ## Model and Quota Notes
 

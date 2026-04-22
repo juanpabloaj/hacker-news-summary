@@ -9,8 +9,17 @@ from .models import FrontPagePost
 ARTICLE_FALLBACK_SUMMARY = "<could not generate article summary>"
 COMMENTS_FALLBACK_SUMMARY = "<could not generate comments summary>"
 
+_EXPANDABLE_OPEN = "<blockquote expandable>"
+_EXPANDABLE_CLOSE = "</blockquote>"
+_EXPANDABLE_OVERHEAD = len(_EXPANDABLE_OPEN) + len(_EXPANDABLE_CLOSE)
 
-def format_article_message(post: FrontPagePost, summary: str | None, max_chars: int) -> str:
+
+def format_article_message(
+    post: FrontPagePost,
+    summary: str | None,
+    max_chars: int,
+    expandable: bool = True,
+) -> str:
     summary_text = sanitize_summary_text(summary) if summary else ARTICLE_FALLBACK_SUMMARY
     url = f"https://news.ycombinator.com/item?id={post.hn_id}"
     source = post.domain or "news.ycombinator.com"
@@ -19,16 +28,29 @@ def format_article_message(post: FrontPagePost, summary: str | None, max_chars: 
         f"{escape(source)} • {post.score} points • {post.comment_count} comments\n"
         f"{url}\n\n"
     )
-    available_summary_chars = _available_summary_chars(header, max_chars)
-    return f"{header}{escape(_truncate_plain_text(summary_text, available_summary_chars))}"
+    available_summary_chars = _available_summary_chars(header, max_chars, expandable)
+    body = escape(_truncate_plain_text(summary_text, available_summary_chars))
+    return f"{header}{_wrap_summary(body, expandable)}"
 
 
-def format_comments_message(post: FrontPagePost, summary: str | None, max_chars: int) -> str:
+def format_comments_message(
+    post: FrontPagePost,
+    summary: str | None,
+    max_chars: int,
+    expandable: bool = True,
+) -> str:
     summary_text = sanitize_summary_text(summary) if summary else COMMENTS_FALLBACK_SUMMARY
     url = f"https://news.ycombinator.com/item?id={post.hn_id}"
     header = f"Comments Summary for: {escape(post.title)}\n{url}\n\n"
-    available_summary_chars = _available_summary_chars(header, max_chars)
-    return f"{header}{escape(_truncate_plain_text(summary_text, available_summary_chars))}"
+    available_summary_chars = _available_summary_chars(header, max_chars, expandable)
+    body = escape(_truncate_plain_text(summary_text, available_summary_chars))
+    return f"{header}{_wrap_summary(body, expandable)}"
+
+
+def _wrap_summary(body: str, expandable: bool) -> str:
+    if not expandable:
+        return body
+    return f"{_EXPANDABLE_OPEN}{body}{_EXPANDABLE_CLOSE}"
 
 
 def sanitize_summary_text(summary: str | None) -> str:
@@ -47,8 +69,9 @@ def telegram_text_length(text: str) -> int:
     return len(unescape(text))
 
 
-def _available_summary_chars(header: str, max_chars: int) -> int:
-    available = max_chars - telegram_text_length(header)
+def _available_summary_chars(header: str, max_chars: int, expandable: bool = False) -> int:
+    overhead = _EXPANDABLE_OVERHEAD if expandable else 0
+    available = max_chars - telegram_text_length(header) - overhead
     return max(1, available)
 
 
