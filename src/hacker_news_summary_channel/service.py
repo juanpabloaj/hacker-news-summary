@@ -150,6 +150,7 @@ class PollingService:
                     post,
                     article_result.summary,
                     max_chars=self.config.telegram_max_message_chars,
+                    expandable=self.config.telegram_expandable_summaries,
                 )
             )
             comments_message_id = self.telegram_client.send_message(
@@ -157,6 +158,7 @@ class PollingService:
                     post,
                     comments_result.summary,
                     max_chars=self.config.telegram_max_message_chars,
+                    expandable=self.config.telegram_expandable_summaries,
                 )
             )
         except Exception:
@@ -201,6 +203,7 @@ class PollingService:
                 post,
                 comments_result.summary,
                 max_chars=self.config.telegram_max_message_chars,
+                expandable=self.config.telegram_expandable_summaries,
             ),
         )
         self.storage.store_comment_summary(
