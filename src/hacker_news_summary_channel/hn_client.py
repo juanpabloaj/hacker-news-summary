@@ -26,7 +26,7 @@ RETRY_DELAY_SECONDS = 1.0
 def fetch_front_page_posts(timeout_seconds: int) -> list[FrontPagePost]:
     try:
         html = _fetch_text(HN_FRONT_PAGE_URL, timeout_seconds)
-    except (HTTPError, URLError, TimeoutError):
+    except (HTTPError, URLError, TimeoutError, ConnectionResetError):
         LOGGER.exception("Failed to fetch Hacker News front page after retries.")
         return []
     entries = _parse_front_page_entries(html)
@@ -57,7 +57,7 @@ def fetch_item(item_id: int, timeout_seconds: int) -> dict[str, Any] | None:
     url = HN_ITEM_API_URL.format(item_id=item_id)
     try:
         raw_json = _fetch_text(url, timeout_seconds)
-    except (HTTPError, URLError, TimeoutError):
+    except (HTTPError, URLError, TimeoutError, ConnectionResetError):
         LOGGER.warning("Failed to fetch Hacker News item %s after retries.", item_id)
         return None
     return json.loads(raw_json)
@@ -122,6 +122,16 @@ def _fetch_text(url: str, timeout_seconds: int) -> str:
                 raise
             LOGGER.warning(
                 "Transient timeout fetching %s on attempt %s/%s: %s",
+                url,
+                attempt,
+                FETCH_MAX_RETRIES,
+                error,
+            )
+        except ConnectionResetError as error:
+            if attempt >= FETCH_MAX_RETRIES:
+                raise
+            LOGGER.warning(
+                "Transient connection reset fetching %s on attempt %s/%s: %s",
                 url,
                 attempt,
                 FETCH_MAX_RETRIES,
