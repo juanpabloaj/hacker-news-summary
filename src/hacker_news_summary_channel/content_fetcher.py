@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import hashlib
+from http.client import RemoteDisconnected
 import logging
 import re
 from html import unescape
@@ -100,6 +101,15 @@ def fetch_article(url: str, timeout_seconds: int, max_chars: int) -> FetchResult
             content_hash=None,
             source_url=url,
             error_message="Timeout",
+        )
+    except RemoteDisconnected as error:
+        LOGGER.warning("Article request disconnected for %s: %s", url, error)
+        return FetchResult(
+            fetch_method="local_http_fetch",
+            content=None,
+            content_hash=None,
+            source_url=url,
+            error_message=f"Remote disconnected: {error}",
         )
 
     decoded = raw_body.decode(charset, errors="replace")

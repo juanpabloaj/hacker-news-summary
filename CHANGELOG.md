@@ -7,12 +7,18 @@ and this project follows semantic versioning for repository tags.
 
 ## [Unreleased]
 
+## [0.2.1] - 2026-05-22
+
 ### Changed
 
 - Bumped the package version to `0.2.1`.
 - Logged the current service version at startup together with the effective configuration.
 - Added a per-cycle circuit breaker for repeated transient Gemini failures such as `503` responses and timeouts.
 - Made startup version logging prefer the repository version over stale installed package metadata.
+
+### Fixed
+
+- Handled remote article fetch disconnects as recoverable fetch failures so posts can continue through fallback summarization.
 
 ## [0.2.0] - 2026-04-16
 
