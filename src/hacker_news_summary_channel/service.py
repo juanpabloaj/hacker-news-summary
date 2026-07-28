@@ -18,6 +18,7 @@ from .summarizer import (
     GeminiClient,
     GeminiDailyQuotaExceededError,
     GeminiError,
+    GeminiNoTextResponseError,
     GeminiTransientError,
 )
 from .telegram import TelegramClient
@@ -75,6 +76,7 @@ class PollingService:
         stats = CycleStats()
         usage_before = self.storage.get_gemini_usage_totals()
         gemini_calls_before = self.storage.get_gemini_call_count()
+        gemini_failures_before = self.storage.get_gemini_failure_count()
         LOGGER.info("Gemini usage before cycle: %s", _format_usage_log(usage_before))
         posts = fetch_front_page_posts(self.config.request_timeout_seconds)
         stats.frontpage_posts_seen = len(posts)
@@ -92,7 +94,9 @@ class PollingService:
                 LOGGER.exception("Post processing failed for hn_id=%s", post.hn_id)
         usage_after = self.storage.get_gemini_usage_totals()
         gemini_calls_after = self.storage.get_gemini_call_count()
+        gemini_failures_after = self.storage.get_gemini_failure_count()
         stats.gemini_calls = gemini_calls_after - gemini_calls_before
+        stats.failures += gemini_failures_after - gemini_failures_before
         LOGGER.info("Gemini usage after cycle: %s", _format_usage_log(usage_after))
         LOGGER.info(
             "Gemini usage delta for cycle: %s",
@@ -134,10 +138,17 @@ class PollingService:
 
     def _publish_initial_messages(self, post: FrontPagePost) -> bool:
         article_result = self._generate_article_summary(post)
-        comments_result = self._generate_comments_summary(post)
-        if article_result.used_fallback or comments_result.used_fallback:
+        if article_result.used_fallback:
             LOGGER.info(
-                "Deferring Telegram publication for hn_id=%s until both summaries are available.",
+                "Deferring Telegram publication for hn_id=%s because the article summary is unavailable.",
+                post.hn_id,
+            )
+            self.storage.clear_publication_state(post.hn_id)
+            return False
+        comments_result = self._generate_comments_summary(post)
+        if comments_result.used_fallback:
+            LOGGER.info(
+                "Deferring Telegram publication for hn_id=%s because the comments summary is unavailable.",
                 post.hn_id,
             )
             self.storage.clear_publication_state(post.hn_id)
@@ -218,6 +229,18 @@ class PollingService:
         return True
 
     def _generate_article_summary(self, post: FrontPagePost) -> ArticleSummaryResult:
+        record = self.storage.get_post(post.hn_id)
+        if record and record.article_summary_terminal_reason:
+            LOGGER.warning(
+                "Skipping article summary for hn_id=%s after terminal Gemini failure: %s",
+                post.hn_id,
+                record.article_summary_terminal_reason,
+            )
+            return ArticleSummaryResult(
+                summary=ARTICLE_FALLBACK_SUMMARY,
+                used_fallback=True,
+                content_hash=None,
+            )
         latest = self.storage.get_latest_article_summary(post.hn_id)
         fetch_result = fetch_article_or_text(
             url=post.url,
@@ -271,6 +294,28 @@ class PollingService:
                 used_fallback=False,
                 content_hash=fetch_result.content_hash,
             )
+        except GeminiNoTextResponseError as error:
+            self._store_gemini_failure(post.hn_id, "article_summary", error)
+            LOGGER.warning(
+                "Gemini article summary returned no text for hn_id=%s "
+                "(reason=%s, response_id=%s). Trying URL context once.",
+                post.hn_id,
+                error.reason,
+                error.response_id,
+            )
+            if post.url:
+                return self._generate_article_summary_from_url_fallback(
+                    post,
+                    local_fetch_error=f"Gemini returned no text: {error.reason}",
+                    primary_terminal_reason=error.reason if error.terminal else None,
+                )
+            if error.terminal:
+                self.storage.mark_article_summary_terminal_failure(post.hn_id, error.reason)
+            return ArticleSummaryResult(
+                summary=ARTICLE_FALLBACK_SUMMARY,
+                used_fallback=True,
+                content_hash=fetch_result.content_hash,
+            )
         except GeminiDailyQuotaExceededError:
             self._mark_gemini_daily_quota_exhausted(post.hn_id)
             return ArticleSummaryResult(
@@ -302,7 +347,10 @@ class PollingService:
             )
 
     def _generate_article_summary_from_url_fallback(
-        self, post: FrontPagePost, local_fetch_error: str | None
+        self,
+        post: FrontPagePost,
+        local_fetch_error: str | None,
+        primary_terminal_reason: str | None = None,
     ) -> ArticleSummaryResult:
         if not post.url:
             return ArticleSummaryResult(
@@ -344,6 +392,33 @@ class PollingService:
                 used_fallback=False,
                 content_hash=None,
             )
+        except GeminiNoTextResponseError as error:
+            self._store_gemini_failure(
+                post.hn_id,
+                "article_url_context_fallback",
+                error,
+            )
+            terminal_reason = primary_terminal_reason
+            if error.terminal:
+                terminal_reason = error.reason
+            if terminal_reason:
+                self.storage.mark_article_summary_terminal_failure(
+                    post.hn_id,
+                    terminal_reason,
+                )
+            LOGGER.warning(
+                "Gemini URL-context article summary returned no text for hn_id=%s "
+                "(reason=%s, response_id=%s, terminal=%s).",
+                post.hn_id,
+                error.reason,
+                error.response_id,
+                terminal_reason is not None,
+            )
+            return ArticleSummaryResult(
+                summary=ARTICLE_FALLBACK_SUMMARY,
+                used_fallback=True,
+                content_hash=None,
+            )
         except GeminiDailyQuotaExceededError:
             self._mark_gemini_daily_quota_exhausted(post.hn_id)
             return ArticleSummaryResult(
@@ -364,6 +439,11 @@ class PollingService:
                 content_hash=None,
             )
         except GeminiError as error:
+            if primary_terminal_reason:
+                self.storage.mark_article_summary_terminal_failure(
+                    post.hn_id,
+                    primary_terminal_reason,
+                )
             LOGGER.warning(
                 "Gemini URL-context article summary failed for hn_id=%s: %s",
                 post.hn_id,
@@ -428,6 +508,20 @@ class PollingService:
                 summary=response.text,
                 comment_tree_hash=tree_hash,
                 used_fallback=False,
+            )
+        except GeminiNoTextResponseError as error:
+            self._store_gemini_failure(post.hn_id, "comments_summary", error)
+            LOGGER.warning(
+                "Gemini comments summary returned no text for hn_id=%s "
+                "(reason=%s, response_id=%s).",
+                post.hn_id,
+                error.reason,
+                error.response_id,
+            )
+            return CommentsSummaryResult(
+                summary=COMMENTS_FALLBACK_SUMMARY,
+                comment_tree_hash=tree_hash,
+                used_fallback=True,
             )
         except GeminiDailyQuotaExceededError:
             self._mark_gemini_daily_quota_exhausted(post.hn_id)
@@ -517,6 +611,23 @@ class PollingService:
 
     def _should_skip_gemini_requests(self) -> bool:
         return self.gemini_daily_quota_exhausted or self.gemini_temporarily_unavailable
+
+    def _store_gemini_failure(
+        self,
+        hn_id: int,
+        operation: str,
+        error: GeminiNoTextResponseError,
+    ) -> None:
+        self.storage.store_gemini_call(
+            hn_id=hn_id,
+            operation=operation,
+            model_name=self.config.gemini_model,
+            response_id=error.response_id,
+            usage=error.usage,
+            outcome="no_text",
+            error_reason=error.reason,
+            diagnostic_metadata=error.diagnostic_metadata,
+        )
 
 
 def should_refresh_comments(

@@ -37,7 +37,9 @@ class Storage:
                     is_frontpage_active INTEGER NOT NULL,
                     article_message_id INTEGER,
                     comments_message_id INTEGER,
-                    comment_update_count INTEGER NOT NULL DEFAULT 0
+                    comment_update_count INTEGER NOT NULL DEFAULT 0,
+                    article_summary_terminal_reason TEXT,
+                    article_summary_terminal_at TEXT
                 );
 
                 CREATE TABLE IF NOT EXISTS post_snapshots (
@@ -95,11 +97,24 @@ class Storage:
                     cached_content_token_count INTEGER NOT NULL DEFAULT 0,
                     thoughts_token_count INTEGER NOT NULL DEFAULT 0,
                     total_token_count INTEGER NOT NULL DEFAULT 0,
+                    outcome TEXT NOT NULL DEFAULT 'success',
+                    error_reason TEXT,
+                    diagnostic_metadata TEXT,
                     created_at TEXT NOT NULL,
                     FOREIGN KEY (hn_id) REFERENCES posts (hn_id)
                 );
                 """
             )
+            _ensure_column(conn, "posts", "article_summary_terminal_reason", "TEXT")
+            _ensure_column(conn, "posts", "article_summary_terminal_at", "TEXT")
+            _ensure_column(
+                conn,
+                "gemini_calls",
+                "outcome",
+                "TEXT NOT NULL DEFAULT 'success'",
+            )
+            _ensure_column(conn, "gemini_calls", "error_reason", "TEXT")
+            _ensure_column(conn, "gemini_calls", "diagnostic_metadata", "TEXT")
 
     @contextmanager
     def connection(self) -> Iterator[sqlite3.Connection]:
@@ -203,6 +218,18 @@ class Storage:
                 (hn_id,),
             )
 
+    def mark_article_summary_terminal_failure(self, hn_id: int, reason: str) -> None:
+        with self.connection() as conn:
+            conn.execute(
+                """
+                UPDATE posts
+                SET article_summary_terminal_reason = ?,
+                    article_summary_terminal_at = ?
+                WHERE hn_id = ?
+                """,
+                (reason, utc_now(), hn_id),
+            )
+
     def store_article_summary(
         self, hn_id: int, content_hash: str | None, model_name: str, summary_text: str
     ) -> None:
@@ -272,6 +299,9 @@ class Storage:
         model_name: str,
         response_id: str | None,
         usage: GeminiUsage,
+        outcome: str = "success",
+        error_reason: str | None = None,
+        diagnostic_metadata: str | None = None,
     ) -> None:
         with self.connection() as conn:
             conn.execute(
@@ -280,9 +310,10 @@ class Storage:
                     hn_id, operation, model_name, response_id,
                     prompt_token_count, candidates_token_count,
                     cached_content_token_count, thoughts_token_count,
-                    total_token_count, created_at
+                    total_token_count, outcome, error_reason,
+                    diagnostic_metadata, created_at
                 )
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 """,
                 (
                     hn_id,
@@ -294,6 +325,9 @@ class Storage:
                     usage.cached_content_token_count,
                     usage.thoughts_token_count,
                     usage.total_token_count,
+                    outcome,
+                    error_reason,
+                    diagnostic_metadata,
                     utc_now(),
                 ),
             )
@@ -323,6 +357,13 @@ class Storage:
         with self.connection() as conn:
             row = conn.execute("SELECT COUNT(*) AS call_count FROM gemini_calls").fetchone()
         return int(row["call_count"])
+
+    def get_gemini_failure_count(self) -> int:
+        with self.connection() as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS failure_count FROM gemini_calls WHERE outcome != 'success'"
+            ).fetchone()
+        return int(row["failure_count"])
 
     def get_latest_article_summary(self, hn_id: int) -> sqlite3.Row | None:
         with self.connection() as conn:
@@ -371,4 +412,16 @@ def _row_to_post_record(row: sqlite3.Row) -> PostRecord:
         article_message_id=row["article_message_id"],
         comments_message_id=row["comments_message_id"],
         comment_update_count=int(row["comment_update_count"]),
+        article_summary_terminal_reason=row["article_summary_terminal_reason"],
     )
+
+
+def _ensure_column(
+    conn: sqlite3.Connection,
+    table_name: str,
+    column_name: str,
+    declaration: str,
+) -> None:
+    columns = {row["name"] for row in conn.execute(f"PRAGMA table_info({table_name})")}
+    if column_name not in columns:
+        conn.execute(f"ALTER TABLE {table_name} ADD COLUMN {column_name} {declaration}")

@@ -24,6 +24,36 @@ class GeminiTransientError(GeminiError):
     """Raised when the request failed due to a transient Gemini outage or timeout."""
 
 
+class GeminiNoTextResponseError(GeminiError):
+    """Raised when Gemini returned a successful response without text output."""
+
+    def __init__(
+        self,
+        reason: str,
+        *,
+        response_id: str | None,
+        usage: GeminiUsage,
+        diagnostic_metadata: str,
+        terminal: bool,
+    ) -> None:
+        super().__init__(f"Gemini response did not include text output (reason={reason}).")
+        self.reason = reason
+        self.response_id = response_id
+        self.usage = usage
+        self.diagnostic_metadata = diagnostic_metadata
+        self.terminal = terminal
+
+
+_TERMINAL_NO_TEXT_REASONS = {
+    "SAFETY",
+    "RECITATION",
+    "LANGUAGE",
+    "BLOCKLIST",
+    "PROHIBITED_CONTENT",
+    "SPII",
+}
+
+
 class GeminiClient:
     def __init__(
         self,
@@ -118,10 +148,16 @@ class GeminiClient:
             try:
                 with urlopen(request, timeout=self.timeout_seconds) as response:
                     body = json.loads(response.read().decode("utf-8"))
+                usage = _extract_usage(body.get("usageMetadata") or {})
+                response_id = body.get("responseId")
                 return GeminiResponse(
-                    text=_extract_response_text(body),
-                    usage=_extract_usage(body.get("usageMetadata") or {}),
-                    response_id=body.get("responseId"),
+                    text=_extract_response_text(
+                        body,
+                        response_id=response_id,
+                        usage=usage,
+                    ),
+                    usage=usage,
+                    response_id=response_id,
                 )
             except HTTPError as error:
                 detail = error.read().decode("utf-8", errors="replace")
@@ -151,7 +187,12 @@ class GeminiClient:
         raise RuntimeError("Unreachable retry state in Gemini client.")
 
 
-def _extract_response_text(body: dict) -> str:
+def _extract_response_text(
+    body: dict,
+    *,
+    response_id: str | None = None,
+    usage: GeminiUsage | None = None,
+) -> str:
     candidates = body.get("candidates") or []
     for candidate in candidates:
         content = candidate.get("content") or {}
@@ -159,7 +200,69 @@ def _extract_response_text(body: dict) -> str:
         texts = [part.get("text", "") for part in parts if part.get("text")]
         if texts:
             return "\n".join(texts).strip()
-    raise RuntimeError("Gemini response did not include text output.")
+    reason = _extract_no_text_reason(body)
+    raise GeminiNoTextResponseError(
+        reason,
+        response_id=response_id or body.get("responseId"),
+        usage=usage or _extract_usage(body.get("usageMetadata") or {}),
+        diagnostic_metadata=_extract_diagnostic_metadata(body),
+        terminal=reason in _TERMINAL_NO_TEXT_REASONS,
+    )
+
+
+def _extract_no_text_reason(body: dict) -> str:
+    prompt_feedback = body.get("promptFeedback") or {}
+    if prompt_feedback.get("blockReason"):
+        return str(prompt_feedback["blockReason"])
+    for candidate in body.get("candidates") or []:
+        if candidate.get("finishReason"):
+            return str(candidate["finishReason"])
+    if not body.get("candidates"):
+        return "NO_CANDIDATES"
+    return "NO_TEXT"
+
+
+def _extract_diagnostic_metadata(body: dict) -> str:
+    prompt_feedback = body.get("promptFeedback") or {}
+    metadata = {
+        "prompt_feedback": _filter_feedback(prompt_feedback),
+        "candidates": [
+            {
+                "index": candidate.get("index"),
+                "finish_reason": candidate.get("finishReason"),
+                "finish_message": _sanitize_diagnostic_text(candidate.get("finishMessage")),
+                "safety_ratings": _filter_safety_ratings(candidate.get("safetyRatings") or []),
+            }
+            for candidate in body.get("candidates") or []
+        ],
+    }
+    return json.dumps(metadata, separators=(",", ":"), sort_keys=True)
+
+
+def _filter_feedback(feedback: dict) -> dict:
+    return {
+        "block_reason": feedback.get("blockReason"),
+        "block_reason_message": _sanitize_diagnostic_text(feedback.get("blockReasonMessage")),
+        "safety_ratings": _filter_safety_ratings(feedback.get("safetyRatings") or []),
+    }
+
+
+def _filter_safety_ratings(ratings: list) -> list[dict]:
+    return [
+        {
+            "category": rating.get("category"),
+            "probability": rating.get("probability"),
+            "blocked": rating.get("blocked"),
+        }
+        for rating in ratings
+        if isinstance(rating, dict)
+    ]
+
+
+def _sanitize_diagnostic_text(value: object, max_chars: int = 500) -> str | None:
+    if not isinstance(value, str):
+        return None
+    return " ".join(value.split())[:max_chars]
 
 
 def _truncate_text(text: str, max_chars: int) -> str:

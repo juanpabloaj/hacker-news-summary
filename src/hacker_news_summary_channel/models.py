@@ -55,3 +55,4 @@ class PostRecord:
     article_message_id: int | None
     comments_message_id: int | None
     comment_update_count: int
+    article_summary_terminal_reason: str | None

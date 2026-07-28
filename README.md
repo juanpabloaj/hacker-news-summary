@@ -75,9 +75,16 @@ For article content, the service uses a hybrid strategy:
 
 - local HTTP fetch plus local text extraction first
 - Gemini URL context as a fallback if local extraction fails and a URL exists
+- one Gemini URL-context attempt if a local-content request returns no text
 - article-summary fallback text if both fail
 
 If Gemini daily quota is exhausted, the service stops making new Gemini requests for the rest of the current cycle and falls back gracefully. The service also stops making further Gemini requests for the rest of the cycle after too many consecutive transient Gemini failures such as `503` responses or timeouts. Initial publications are deferred until both summaries are available; fallback placeholder summaries are not published for new posts.
+
+Successful Gemini responses without text are classified using `promptFeedback.blockReason` and
+candidate `finishReason` metadata. Policy, safety, recitation, blocklist, prohibited-content,
+language, and sensitive-PII reasons are terminal after the URL-context fallback also fails. The
+post is then skipped without repeating the same requests in later cycles. Diagnostic metadata is
+stored without prompts or generated content.
 
 ## Telegram Output
 
@@ -128,11 +135,14 @@ The service logs:
 - effective startup configuration, with secrets masked
 - per-cycle Gemini token usage totals and deltas
 - per-cycle operational counts such as qualifying posts, publications, updates, failures, and Gemini call count
+- no-text response reasons; sanitized Gemini diagnostic metadata is persisted for auditing
 
 Expected failures are handled defensively:
 
 - article fetch failures do not block comment summaries
 - Gemini failures fall back internally and defer initial publication to a later cycle
+- article no-text responses get one URL-context fallback before terminal failures are persisted
+- comment summarization is skipped when the article summary is unavailable
 - repeated transient Gemini failures trip a per-cycle circuit breaker to avoid wasting time on more requests
 - duplicate Telegram publications are avoided through SQLite state
 - partial initial Telegram publications are rolled back if the second send fails
@@ -161,12 +171,12 @@ The process runs one cycle and exits.
 
 The local database keeps enough state to support idempotency, auditing, and updates. Main record groups:
 
-- `posts`: tracked post state and Telegram message IDs
+- `posts`: tracked post state, Telegram message IDs, and terminal article-summary failures
 - `post_snapshots`: score and comment snapshots over time
 - `article_summaries`: stored article summaries by content hash
 - `article_fetches`: fetched raw content, prepared Gemini input, and fetch errors
 - `comment_summaries`: stored comments summaries by comment-tree hash
-- `gemini_calls`: per-call token usage and model metadata
+- `gemini_calls`: per-call token usage, outcome, failure reason, and sanitized diagnostic metadata
 
 ### Operational Scope
 

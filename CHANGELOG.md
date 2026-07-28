@@ -7,6 +7,18 @@ and this project follows semantic versioning for repository tags.
 
 ## [Unreleased]
 
+### Changed
+
+- Added one URL-context fallback when Gemini returns a successful article response without text.
+- Skipped comment summarization when the article summary is unavailable.
+- Included no-text Gemini calls in cycle call, usage, and failure metrics.
+
+### Fixed
+
+- Classified no-text Gemini responses using prompt-block and candidate-finish metadata.
+- Persisted sanitized no-text diagnostics and terminal article failures to prevent repeated blocked
+  requests in later cycles.
+
 ## [0.2.1] - 2026-05-22
 
 ### Changed

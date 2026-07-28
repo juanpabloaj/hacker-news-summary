@@ -5,13 +5,19 @@ from pathlib import Path
 import pytest
 
 from hacker_news_summary_channel.config import Config
-from hacker_news_summary_channel.models import FrontPagePost
+from hacker_news_summary_channel.models import (
+    FetchResult,
+    FrontPagePost,
+    GeminiResponse,
+    GeminiUsage,
+)
 from hacker_news_summary_channel.service import (
     ArticleSummaryResult,
     CommentsSummaryResult,
     PollingService,
 )
 from hacker_news_summary_channel.storage import Storage
+from hacker_news_summary_channel.summarizer import GeminiNoTextResponseError
 
 
 class FakeTelegramClient:
@@ -41,6 +47,35 @@ class FakeTelegramClient:
         self.deleted_message_ids.append(message_id)
 
 
+class FakeGeminiClient:
+    def __init__(
+        self,
+        *,
+        article_error: Exception | None = None,
+        url_error: Exception | None = None,
+        url_response: GeminiResponse | None = None,
+    ) -> None:
+        self.article_error = article_error
+        self.url_error = url_error
+        self.url_response = url_response
+        self.article_calls = 0
+        self.url_calls = 0
+
+    def summarize_article(self, *_args, **_kwargs) -> GeminiResponse:
+        self.article_calls += 1
+        if self.article_error:
+            raise self.article_error
+        raise AssertionError("No article response configured.")
+
+    def summarize_article_from_url(self, *_args, **_kwargs) -> GeminiResponse:
+        self.url_calls += 1
+        if self.url_error:
+            raise self.url_error
+        if self.url_response:
+            return self.url_response
+        raise AssertionError("No URL-context response configured.")
+
+
 def test_initial_publication_is_deferred_until_both_summaries_exist(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -61,24 +96,107 @@ def test_initial_publication_is_deferred_until_both_summaries_exist(
             content_hash=None,
         ),
     )
-    monkeypatch.setattr(
-        service,
-        "_generate_comments_summary",
-        lambda _post: CommentsSummaryResult(
-            summary="Comments summary",
-            comment_tree_hash="tree-1",
-            used_fallback=False,
-        ),
-    )
+    comments_calls = []
+
+    def fail_if_comments_are_generated(_post):
+        comments_calls.append(_post.hn_id)
+        raise AssertionError("Comments should not be summarized after an article failure.")
+
+    monkeypatch.setattr(service, "_generate_comments_summary", fail_if_comments_are_generated)
 
     published = service._publish_initial_messages(post)
 
     assert not published
+    assert comments_calls == []
     assert telegram_client.send_calls == []
     assert storage.get_post(post.hn_id).article_message_id is None
     assert storage.get_post(post.hn_id).comments_message_id is None
     assert storage.get_latest_article_summary(post.hn_id) is None
     assert storage.get_latest_comment_summary(post.hn_id) is None
+
+
+def test_article_no_text_response_uses_url_context_fallback_once(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = Storage(str(tmp_path / "app.db"))
+    storage.initialize()
+    post = _sample_post()
+    storage.upsert_post(post)
+    gemini_client = FakeGeminiClient(
+        article_error=_no_text_error("SAFETY", terminal=True),
+        url_response=GeminiResponse(
+            text="URL context summary",
+            usage=GeminiUsage(prompt_token_count=20, candidates_token_count=5),
+            response_id="url-success",
+        ),
+    )
+    service = PollingService(
+        Config(), storage, gemini_client=gemini_client, telegram_client=FakeTelegramClient()
+    )
+    monkeypatch.setattr(
+        "hacker_news_summary_channel.service.fetch_article_or_text",
+        lambda **_kwargs: FetchResult(
+            fetch_method="local_http_fetch",
+            content="Article content",
+            content_hash="content-1",
+            source_url=post.url,
+            raw_content="Article content",
+            gemini_input_text="Article content",
+        ),
+    )
+
+    result = service._generate_article_summary(post)
+
+    assert result.summary == "URL context summary"
+    assert not result.used_fallback
+    assert gemini_client.article_calls == 1
+    assert gemini_client.url_calls == 1
+    assert storage.get_gemini_call_count() == 2
+    assert storage.get_gemini_failure_count() == 1
+    assert storage.get_post(post.hn_id).article_summary_terminal_reason is None
+
+
+def test_repeated_terminal_no_text_response_marks_article_as_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    storage = Storage(str(tmp_path / "app.db"))
+    storage.initialize()
+    post = _sample_post()
+    storage.upsert_post(post)
+    gemini_client = FakeGeminiClient(
+        article_error=_no_text_error("SAFETY", terminal=True),
+        url_error=_no_text_error("RECITATION", terminal=True),
+    )
+    service = PollingService(
+        Config(), storage, gemini_client=gemini_client, telegram_client=FakeTelegramClient()
+    )
+    fetch_calls = []
+
+    def fetch_article(**_kwargs):
+        fetch_calls.append(post.hn_id)
+        return FetchResult(
+            fetch_method="local_http_fetch",
+            content="Article content",
+            content_hash="content-1",
+            source_url=post.url,
+        )
+
+    monkeypatch.setattr(
+        "hacker_news_summary_channel.service.fetch_article_or_text",
+        fetch_article,
+    )
+
+    first_result = service._generate_article_summary(post)
+    second_result = service._generate_article_summary(post)
+
+    assert first_result.used_fallback
+    assert second_result.used_fallback
+    assert gemini_client.article_calls == 1
+    assert gemini_client.url_calls == 1
+    assert fetch_calls == [post.hn_id]
+    assert storage.get_gemini_call_count() == 2
+    assert storage.get_gemini_failure_count() == 2
+    assert storage.get_post(post.hn_id).article_summary_terminal_reason == "RECITATION"
 
 
 def test_initial_publication_stores_state_only_after_both_messages_succeed(
@@ -298,6 +416,16 @@ def _sample_post() -> FrontPagePost:
         comment_count=80,
         text=None,
         post_type="link",
+    )
+
+
+def _no_text_error(reason: str, *, terminal: bool) -> GeminiNoTextResponseError:
+    return GeminiNoTextResponseError(
+        reason,
+        response_id=f"response-{reason.lower()}",
+        usage=GeminiUsage(prompt_token_count=10, total_token_count=10),
+        diagnostic_metadata='{"candidates":[]}',
+        terminal=terminal,
     )
 
 
