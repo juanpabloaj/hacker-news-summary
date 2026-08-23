@@ -15,6 +15,8 @@ and this project follows semantic versioning for repository tags.
 
 ### Fixed
 
+- Retried transient Telegram API failures (429/5xx, connection errors) instead of failing the post,
+  honoring the `retry_after` hint on rate limits.
 - Classified no-text Gemini responses using prompt-block and candidate-finish metadata.
 - Persisted sanitized no-text diagnostics and terminal article failures to prevent repeated blocked
   requests in later cycles.
